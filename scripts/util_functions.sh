@@ -14,10 +14,6 @@
 # The path to store temporary files that don't need to persist
 # TMPDIR=
 
-# The path to store files that can be persisted (non-volatile storage)
-# Any modification to this variable should go through the function `set_nvbase`
-# NVBASE=
-
 # The non-volatile path where magisk executables are stored
 # MAGISKBIN=
 
@@ -82,11 +78,6 @@ abort() {
   [ ! -z $MODPATH ] && rm -rf $MODPATH
   rm -rf $TMPDIR
   exit 1
-}
-
-set_nvbase() {
-  NVBASE="$1"
-  MAGISKBIN="$1/magisk"
 }
 
 print_title() {
@@ -216,7 +207,7 @@ find_block() {
   for BLOCK in "$@"; do
     DEVICE=$(find /dev/block \( -type b -o -type c -o -type l \) -iname $BLOCK | head -n 1) 2>/dev/null
     if [ ! -z $DEVICE ]; then
-      readlink -f $DEVICE
+      echo $DEVICE
       return 0
     fi
   done
@@ -235,7 +226,7 @@ find_block() {
   for DEV in "$@"; do
     DEVICE=$(find /dev \( -type b -o -type c -o -type l \) -maxdepth 1 -iname $DEV | head -n 1) 2>/dev/null
     if [ ! -z $DEVICE ]; then
-      readlink -f $DEVICE
+      echo $DEVICE
       return 0
     fi
   done
@@ -279,7 +270,7 @@ mount_ro_ensure() {
 }
 
 # After calling this method, the following variables will be set:
-# SLOT, SYSTEM_AS_ROOT
+# SLOT, SYSTEM_AS_ROOT, LEGACYSAR
 mount_partitions() {
   # Check A/B slot
   SLOT=$(grep_cmdline androidboot.slot_suffix)
@@ -313,10 +304,27 @@ mount_partitions() {
     fi
   fi
   $SYSTEM_AS_ROOT && ui_print "- Device is system-as-root"
+
+  LEGACYSAR=false
+  if $BOOTMODE; then
+    grep ' / ' /proc/mounts | grep -q '/dev/root' && LEGACYSAR=true
+  else
+    # Recovery mode, assume devices that don't use dynamic partitions are legacy SAR
+    local IS_DYNAMIC=false
+    if grep -q 'androidboot.super_partition' /proc/cmdline; then
+      IS_DYNAMIC=true
+    elif [ -n "$(find_block super)" ]; then
+      IS_DYNAMIC=true
+    fi
+    if $SYSTEM_AS_ROOT && ! $IS_DYNAMIC; then
+      LEGACYSAR=true
+      ui_print "- Legacy SAR, force kernel to load rootfs"
+    fi
+  fi
 }
 
 # After calling this method, the following variables will be set:
-# ISENCRYPTED, PATCHVBMETAFLAG, LEGACYSAR,
+# ISENCRYPTED, PATCHVBMETAFLAG,
 # KEEPVERITY, KEEPFORCEENCRYPT, RECOVERYMODE
 get_flags() {
   if grep ' /data ' /proc/mounts | grep -q 'dm-'; then
@@ -334,22 +342,6 @@ get_flags() {
   else
     PATCHVBMETAFLAG=true
     ui_print "- No vbmeta partition, patch vbmeta in boot image"
-  fi
-  LEGACYSAR=false
-  if $BOOTMODE; then
-    grep ' / ' /proc/mounts | grep -q '/dev/root' && LEGACYSAR=true
-  else
-    # Recovery mode, assume devices that don't use dynamic partitions are legacy SAR
-    local IS_DYNAMIC=false
-    if grep -q 'androidboot.super_partition' /proc/cmdline; then
-      IS_DYNAMIC=true
-    elif [ -n "$(find_block super)" ]; then
-      IS_DYNAMIC=true
-    fi
-    if $SYSTEM_AS_ROOT && ! $IS_DYNAMIC; then
-      LEGACYSAR=true
-      ui_print "- Legacy SAR, force kernel to load rootfs"
-    fi
   fi
 
   # Overridable config flags with safe defaults
@@ -378,11 +370,20 @@ get_flags() {
 find_boot_image() {
   BOOTIMAGE=
   if $RECOVERYMODE; then
-    BOOTIMAGE=$(find_block "recovery_ramdisk$SLOT" "recovery$SLOT" "sos")
-  elif [ ! -z $SLOT ]; then
-    BOOTIMAGE=$(find_block "ramdisk$SLOT" "recovery_ramdisk$SLOT" "init_boot$SLOT" "boot$SLOT")
+    BOOTIMAGE=$(find_block "recovery$SLOT" "sos")
+  elif [ -e "/dev/block/by-name/init_boot$SLOT" ] && [ "$(uname -r | cut -d. -f1)" -ge 5 ] && uname -r | grep -Evq "android12-|^5\.4"; then
+    # init_boot is only used with GKI 13+. It is possible that some devices with init_boot
+    # partition still uses Android 12 GKI or previous kernels, so we need to explicitly detect that scenario.
+    BOOTIMAGE="/dev/block/by-name/init_boot$SLOT"
+  elif [ -e "/dev/block/by-name/boot$SLOT" ]; then
+    # Standard location since AOSP Android 10+
+    BOOTIMAGE="/dev/block/by-name/boot$SLOT"
+  elif [ -n "$SLOT" ]; then
+    # Fallback for A/B devices running < Android 10
+    BOOTIMAGE=$(find_block "ramdisk$SLOT" "boot$SLOT")
   else
-    BOOTIMAGE=$(find_block ramdisk recovery_ramdisk kern-a android_boot kernel bootimg init_boot boot lnx boot_a)
+    # Fallback for all legacy and non-standard devices
+    BOOTIMAGE=$(find_block ramdisk kern-a android_boot kernel bootimg boot lnx boot_a)
   fi
   if [ -z $BOOTIMAGE ]; then
     # Lets see what fstabs tells me
@@ -490,11 +491,7 @@ remove_system_su() {
 api_level_arch_detect() {
   API=$(grep_get_prop ro.build.version.sdk)
   ABI=$(grep_get_prop ro.product.cpu.abi)
-  if [ "$ABI" = "x86" ]; then
-    ARCH=x86
-    ABI32=x86
-    IS64BIT=false
-  elif [ "$ABI" = "arm64-v8a" ]; then
+  if [ "$ABI" = "arm64-v8a" ]; then
     ARCH=arm64
     ABI32=armeabi-v7a
     IS64BIT=true
@@ -502,11 +499,18 @@ api_level_arch_detect() {
     ARCH=x64
     ABI32=x86
     IS64BIT=true
-  else
+  elif [ "$ABI" = "armeabi-v7a" ]; then
     ARCH=arm
-    ABI=armeabi-v7a
     ABI32=armeabi-v7a
     IS64BIT=false
+  elif [ "$ABI" = "x86" ]; then
+    ARCH=x86
+    ABI32=x86
+    IS64BIT=false
+  elif [ "$ABI" = "riscv64" ]; then
+    ARCH=riscv64
+    ABI32=riscv32
+    IS64BIT=true
   fi
 }
 
@@ -520,13 +524,13 @@ check_data() {
     $DATA && [ -d /data/adb ] && touch /data/adb/.rw && rm /data/adb/.rw && DATA_DE=true
     $DATA_DE && [ -d /data/adb/magisk ] || mkdir /data/adb/magisk || DATA_DE=false
   fi
-  set_nvbase "/data"
-  $DATA || set_nvbase "/cache/data_adb"
-  $DATA_DE && set_nvbase "/data/adb"
+  MAGISKBIN="/data/magisk"
+  $DATA || MAGISKBIN="/cache/data_adb/magisk"
+  $DATA_DE && MAGISKBIN="/data/adb/magisk"
 }
 
 run_migrations() {
-  local LOCSHA1
+  local SHA1
   local TARGET
   # Legacy app installation
   local BACKUP=$MAGISKBIN/stock_boot*.gz
@@ -538,50 +542,48 @@ run_migrations() {
   # Legacy backup
   for gz in /data/stock_boot*.gz; do
     [ -f $gz ] || break
-    LOCSHA1=$(basename $gz | sed -e 's/stock_boot_//' -e 's/.img.gz//')
-    [ -z $LOCSHA1 ] && break
-    mkdir /data/magisk_backup_${LOCSHA1} 2>/dev/null
-    mv $gz /data/magisk_backup_${LOCSHA1}/boot.img.gz
+    SHA1=$(basename $gz | sed -e 's/stock_boot_//' -e 's/.img.gz//')
+    [ -z $SHA1 ] && break
+    mkdir /data/magisk_backup_${SHA1} 2>/dev/null
+    mv $gz /data/magisk_backup_${SHA1}/boot.img.gz
   done
 
   # Stock backups
-  LOCSHA1=$SHA1
+  SHA1=
   for name in boot dtb dtbo dtbs; do
     BACKUP=$MAGISKBIN/stock_${name}.img
     [ -f $BACKUP ] || continue
     if [ $name = 'boot' ]; then
-      LOCSHA1=$($MAGISKBIN/magiskboot sha1 $BACKUP)
-      mkdir /data/magisk_backup_${LOCSHA1} 2>/dev/null
+      SHA1=$($MAGISKBIN/magiskboot sha1 $BACKUP)
+      mkdir /data/magisk_backup_${SHA1} 2>/dev/null
     fi
-    TARGET=/data/magisk_backup_${LOCSHA1}/${name}.img
+    [ -z $SHA1 ] && break
+    TARGET=/data/magisk_backup_${SHA1}/${name}.img
     cp $BACKUP $TARGET
     rm -f $BACKUP
     gzip -9f $TARGET
   done
+
+  copy_preinit_files
 }
 
 copy_preinit_files() {
-  local PREINITDIR=$(magisk --path)/.magisk/preinit
-  if ! grep -q " $PREINITDIR " /proc/mounts; then
+  local PREINITDIR=$MAGISKTMP/.magisk/preinit
+  if [ ! -d $PREINITDIR ]; then
     ui_print "- Unable to find preinit dir"
     return 1
   fi
 
-  if ! grep -q "/adb/modules $PREINITDIR " /proc/self/mountinfo; then
-    rm -rf $PREINITDIR/*
-  fi
-
   # Copy all enabled sepolicy.rule
-  for r in $NVBASE/modules*/*/sepolicy.rule; do
+  for r in /data/adb/modules*/*/sepolicy.rule; do
     [ -f "$r" ] || continue
     local MODDIR=${r%/*}
     [ -f $MODDIR/disable ] && continue
     [ -f $MODDIR/remove ] && continue
     [ -f $MODDIR/update ] && continue
-    local MODNAME=${MODDIR##*/}
-    mkdir -p $PREINITDIR/$MODNAME
-    cp -f $r $PREINITDIR/$MODNAME/sepolicy.rule
-  done
+    cat $r
+    echo
+  done > $PREINITDIR/sepolicy.rule
 }
 
 #################
@@ -619,6 +621,15 @@ is_legacy_script() {
   return $?
 }
 
+# $1 = MODPATH
+set_default_perm() {
+  set_perm_recursive $1 0 0 0755 0644
+  set_perm_recursive $1/system/bin 0 2000 0755 0755
+  set_perm_recursive $1/system/xbin 0 2000 0755 0755
+  set_perm_recursive $1/system/system_ext/bin 0 2000 0755 0755
+  set_perm_recursive $1/system/vendor/bin 0 2000 0755 0755 u:object_r:vendor_file:s0
+}
+
 # Require OUTFD, ZIPFILE to be set
 install_module() {
   rm -rf $TMPDIR
@@ -639,11 +650,11 @@ install_module() {
 
   # Extract prop file
   unzip -o "$ZIPFILE" module.prop -d $TMPDIR >&2
-  [ ! -f $TMPDIR/module.prop ] && abort "! Unable to extract zip file!"
+  [ ! -f $TMPDIR/module.prop ] && abort "! This zip is not a Magisk module!"
 
   local MODDIRNAME=modules
   $BOOTMODE && MODDIRNAME=modules_update
-  local MODULEROOT=$NVBASE/$MODDIRNAME
+  local MODULEROOT=/data/adb/$MODDIRNAME
   MODID=$(grep_prop id $TMPDIR/module.prop)
   MODNAME=$(grep_prop name $TMPDIR/module.prop)
   MODAUTH=$(grep_prop author $TMPDIR/module.prop)
@@ -681,13 +692,7 @@ install_module() {
     if ! grep -q '^SKIPUNZIP=1$' $MODPATH/customize.sh 2>/dev/null; then
       ui_print "- Extracting module files"
       unzip -o "$ZIPFILE" -x 'META-INF/*' -d $MODPATH >&2
-
-      # Default permissions
-      set_perm_recursive $MODPATH 0 0 0755 0644
-      set_perm_recursive $MODPATH/system/bin 0 2000 0755 0755
-      set_perm_recursive $MODPATH/system/xbin 0 2000 0755 0755
-      set_perm_recursive $MODPATH/system/system_ext/bin 0 2000 0755 0755
-      set_perm_recursive $MODPATH/system/vendor/bin 0 2000 0755 0755 u:object_r:vendor_file:s0
+      set_default_perm $MODPATH
     fi
 
     # Load customization script
@@ -700,12 +705,18 @@ install_module() {
     mktouch $MODPATH$TARGET/.replace
   done
 
+  for TARGET in $REMOVE; do
+    ui_print "- Remove target: $TARGET"
+    mkdir -p $(dirname $MODPATH$TARGET) 2>/dev/null
+    mknod $MODPATH$TARGET c 0 0
+  done
+
   if $BOOTMODE; then
     # Update info for Magisk app
-    mktouch $NVBASE/modules/$MODID/update
-    rm -rf $NVBASE/modules/$MODID/remove 2>/dev/null
-    rm -rf $NVBASE/modules/$MODID/disable 2>/dev/null
-    cp -af $MODPATH/module.prop $NVBASE/modules/$MODID/module.prop
+    mktouch /data/adb/modules/$MODID/update
+    rm -rf /data/adb/modules/$MODID/remove 2>/dev/null
+    rm -rf /data/adb/modules/$MODID/disable 2>/dev/null
+    cp -af $MODPATH/module.prop /data/adb/modules/$MODID/module.prop
   fi
 
   # Copy over custom sepolicy rules
@@ -737,4 +748,4 @@ install_module() {
 [ -z $BOOTMODE ] && BOOTMODE=false
 
 TMPDIR=/dev/tmp
-set_nvbase "/data/adb"
+MAGISKBIN="/data/adb/magisk"
